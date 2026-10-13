@@ -1,0 +1,18 @@
+# LiteLLM proxy config for clauden: Claude Code -> LiteLLM -> NVIDIA NIM
+# The wildcard route accepts ANY NVIDIA model id, so you never need to edit this
+# file to try a new model: request "nvidia_nim/<publisher>/<model>".
+model_list:
+  - model_name: "nvidia_nim/*"
+    litellm_params:
+      model: "nvidia_nim/*"
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+      api_base: https://integrate.api.nvidia.com/v1
+      timeout: 600
+
+litellm_settings:
+  drop_params: true          # drop Anthropic-only params the model doesn't support
+  num_retries: 3             # retry 429s from the ~40 RPM free-tier limit
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

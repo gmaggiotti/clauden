@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# clauden — run Claude Code against NVIDIA NIM models through a local LiteLLM proxy.
+#
+# Usage:
+#   clauden <model> [claude args...]   e.g. clauden kimi-k3
+#                                           clauden moonshotai/kimi-k3 -p "explain this repo"
+#   clauden --list [filter]            list model ids available on your NVIDIA key
+#   clauden --stop                     stop the background LiteLLM proxy
+#   clauden --logs                     tail the proxy log
+#
+# Env (optional, can live in ~/.clauden/env):
+#   NVIDIA_NIM_API_KEY   your nvapi-... key (required)
+#   CLAUDEN_FAST_MODEL   model for Claude Code's background calls (default: same as main model)
+#   CLAUDEN_PORT         proxy port (default 4000)
+set -euo pipefail
+
+CLAUDEN_HOME="${CLAUDEN_HOME:-$HOME/.clauden}"
+[[ -f "$CLAUDEN_HOME/env" ]] && source "$CLAUDEN_HOME/env"
+
+PORT="${CLAUDEN_PORT:-4000}"
+CONFIG="$CLAUDEN_HOME/config.yaml"
+LOG="$CLAUDEN_HOME/litellm.log"
+PIDFILE="$CLAUDEN_HOME/litellm.pid"
+MODELS_CACHE="$CLAUDEN_HOME/models.txt"
+NIM_BASE="https://integrate.api.nvidia.com/v1"
+export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-clauden-local}"
+
+die() { echo "clauden: $*" >&2; exit 1; }
+
+need_key() {
+  [[ -n "${NVIDIA_NIM_API_KEY:-}" ]] || die "NVIDIA_NIM_API_KEY not set (export it or put it in $CLAUDEN_HOME/env)"
+  export NVIDIA_NIM_API_KEY
+}
+
+# Fetch (and cache for 24h) the list of model ids on the NVIDIA endpoint.
+models() {
+  need_key
+  if [[ ! -s "$MODELS_CACHE" || -n "$(find "$MODELS_CACHE" -mmin +1440 2>/dev/null)" ]]; then
+    curl -fsS -H "Authorization: Bearer $NVIDIA_NIM_API_KEY" "$NIM_BASE/models" \
+      | python3 -c 'import sys,json; [print(m["id"]) for m in json.load(sys.stdin)["data"]]' \
+      | sort > "$MODELS_CACHE.tmp" && mv "$MODELS_CACHE.tmp" "$MODELS_CACHE" \
+      || die "could not fetch model list from NVIDIA (check your key / network)"
+  fi
+  cat "$MODELS_CACHE"
+}
+
+# Turn a short name like "kimi-k3" into a full id like "moonshotai/kimi-k3".
+resolve() {
+  local name="$1" matches
+  [[ "$name" == nvidia_nim/* ]] && name="${name#nvidia_nim/}"
+  if [[ "$name" == */* ]]; then echo "$name"; return; fi
+  matches="$(models | grep -i -E "/${name}$" || true)"
+  [[ -z "$matches" ]] && matches="$(models | grep -i -F "$name" || true)"
+  local n; n="$(grep -c . <<<"$matches" || true)"
+  if [[ "$n" -eq 1 ]]; then echo "$matches"; return; fi
+  if [[ "$n" -eq 0 ]]; then die "no NVIDIA model matches '$name' (try: clauden --list)"; fi
+  echo "clauden: '$name' is ambiguous, pick one:" >&2; sed 's/^/  /' <<<"$matches" >&2; exit 1
+}
+
+proxy_up() { curl -fsS -m 2 "http://127.0.0.1:$PORT/health/liveliness" >/dev/null 2>&1; }
+
+start_proxy() {
+  proxy_up && return
+  command -v litellm >/dev/null || die "litellm not found (run install.sh, or: uv tool install 'litellm[proxy]')"
+  [[ -f "$CONFIG" ]] || die "missing $CONFIG (run install.sh)"
+  echo "clauden: starting LiteLLM proxy on :$PORT (log: $LOG)" >&2
+  nohup litellm --config "$CONFIG" --port "$PORT" --host 127.0.0.1 >"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  for _ in $(seq 1 60); do proxy_up && return; sleep 1; done
+  tail -20 "$LOG" >&2; die "proxy failed to start"
+}
+
+stop_proxy() {
+  if [[ -f "$PIDFILE" ]] && kill "$(cat "$PIDFILE")" 2>/dev/null; then echo "proxy stopped"; else echo "proxy not running"; fi
+  rm -f "$PIDFILE"
+}
+
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --list) shift; models | grep -i -- "${1:-}" ; exit 0 ;;
+  --stop) stop_proxy; exit 0 ;;
+  --logs) exec tail -f "$LOG" ;;
+esac
+
+need_key
+MODEL="nvidia_nim/$(resolve "$1")"; shift
+FAST="$MODEL"
+[[ -n "${CLAUDEN_FAST_MODEL:-}" ]] && FAST="nvidia_nim/$(resolve "$CLAUDEN_FAST_MODEL")"
+
+start_proxy
+
+# Point Claude Code at the proxy; map every model tier to the chosen NVIDIA model.
+unset ANTHROPIC_API_KEY
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+export ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY"
+export ANTHROPIC_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$FAST"
+export ANTHROPIC_SMALL_FAST_MODEL="$FAST"      # older Claude Code versions
+export CLAUDE_CODE_SUBAGENT_MODEL="$MODEL"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
+echo "clauden: $MODEL (fast: $FAST)" >&2
+exec claude "$@"
